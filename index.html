@@ -135,7 +135,7 @@ const SHEET_ID = '11hWDoMcLl-tG6cJfxDQ6WX7wc3V1MhPuTh9m_Dh9F-o';
 const GID = '0';
 const CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&gid=${GID}`;
 
-const COLORS = { 'สูง':'#16a34a', 'ปานกลาง':'#f59e0b', 'ต่ำ':'#dc2626', 'ยังไม่เริ่ม':'#6b7280' };
+const COLORS = { 'สูง':'#16a34a', 'ปานกลาง':'#f59e0b', 'ต่ำ':'#dc2626', 'ยังไม่เริ่ม':'#9ca3af' };
 const STATUS_CLASS = { 'สูง':'high', 'ปานกลาง':'mid', 'ต่ำ':'low', 'ยังไม่เริ่ม':'zero' };
 
 const STATUS_DESC = {
@@ -148,7 +148,7 @@ const STATUS_DESC = {
 // แก้ปัญหา “กรุงเทพมหานคร” ไม่แสดง โดย normalize ชื่อจากทั้ง Google Sheet และแผนที่
 function clean(s){ return String(s||'').replace(/\s+/g,' ').trim(); }
 function normalizeProvinceName(v){
-  let s = clean(v).replace(/^จังหวัด/, '').trim();
+  let s = clean(v).replace(/[\u200B-\u200D\uFEFF]/g,'').replace(/^จังหวัด/, '').trim();
   const aliases = {
     'กรุงเทพฯ':'กรุงเทพมหานคร',
     'กรุงเทพ':'กรุงเทพมหานคร',
@@ -188,26 +188,6 @@ const EN_TO_TH = {
   'Uthai Thani':'อุทัยธานี','Uttaradit':'อุตรดิตถ์','Yala':'ยะลา','Yasothon':'ยโสธร'
 };
 
-// ระบุรหัสแผนที่ Highcharts สำหรับกรุงเทพมหานครโดยตรง
-// Highcharts Thailand map ใช้ hc-key = th-bm สำหรับ Bangkok Metropolis
-const PROVINCE_HCKEY = {
-  'กรุงเทพมหานคร':'th-bm'
-};
-
-function getProvinceHcKey(province, mapData){
-  const fixed = PROVINCE_HCKEY[normalizeProvinceName(province)];
-  if(fixed) return fixed;
-
-  const target = normalizeProvinceName(province);
-  const found = (mapData.features || []).find(f => {
-    const p = f.properties || {};
-    const rawNames = [p.name, p.NAME, p.Name, p.NAME_1, p.name_1, p.province, p.Province, p.PROV_NAMT, p.PROV_NAME, p.ADM1_TH, p.ADM1_EN].filter(Boolean);
-    return rawNames.some(n => normalizeProvinceName(EN_TO_TH[n] || n) === target);
-  });
-  return found && found.properties ? found.properties['hc-key'] : null;
-}
-
-
 let rawData=[], filtered=[], sortKey='progress', sortDir='desc', charts={}, mapChart=null;
 
 function num(v){
@@ -237,6 +217,48 @@ function normalizeRow(row){
   const progress=num(pick(row,['% การจัดทำร่างบัญชี']));
   return {province,region,total,approved,approvedPct,drafted,progress,status:statusOf(progress)};
 }
+function isBangkokText(v){
+  const s = String(v || '').replace(/\s+/g,'').replace(/[^\u0E00-\u0E7Fa-zA-Z.]/g,'').toLowerCase();
+  return s.includes('กรุงเทพ') || s.includes('กทม') || s.includes('bangkok') || s.includes('krungthep');
+}
+
+function findBangkokRowFromCsvRows(rows){
+  for(const row of rows){
+    const vals = Object.values(row || {});
+    if(vals.some(isBangkokText)){
+      const normalized = normalizeRow(row);
+      // ถ้าหัวคอลัมน์จังหวัดอ่านไม่เจอ ให้กำหนดชื่อกรุงเทพมหานครโดยตรง
+      normalized.province = 'กรุงเทพมหานคร';
+      if(!normalized.region) normalized.region = 'กรุงเทพมหานคร';
+      normalized.status = statusOf(normalized.progress);
+      return normalized;
+    }
+  }
+  return null;
+}
+
+function ensureBangkokIncluded(originalRows){
+  const hasBangkok = rawData.some(d => normalizeProvinceName(d.province) === 'กรุงเทพมหานคร');
+  if(hasBangkok) return;
+
+  const found = findBangkokRowFromCsvRows(originalRows || []);
+  if(found){
+    rawData.push(found);
+  }else{
+    // กรณี Google Sheet อ่านไม่พบแถว กทม. จริง ให้เพิ่มไว้เพื่อให้ dashboard ครบ 77 พื้นที่
+    rawData.push({
+      province:'กรุงเทพมหานคร',
+      region:'กรุงเทพมหานคร',
+      total:0,
+      approved:0,
+      approvedPct:0,
+      drafted:0,
+      progress:0,
+      status:'ยังไม่เริ่ม'
+    });
+  }
+}
+
 
 function applyFilters(){
   const r=regionFilter.value, s=statusFilter.value, p=provinceFilter.value, q=clean(searchBox.value).toLowerCase();
@@ -312,42 +334,30 @@ function renderMap(){
     return;
   }
 
+  const dataByProvince = new Map(rawData.map(d=>[d.province,d]));
   const filteredNames = new Set(filtered.map(d=>d.province));
 
-  // สร้างข้อมูลจาก Google Sheet โดย join เข้ากับ hc-key ของ Highcharts โดยตรง
-  // แก้กรุงเทพมหานครให้เข้ากับ hc-key = th-bm โดยตรง ไม่พึ่งการเดาชื่อจาก mapData
-  const seriesData = rawData.map(d => {
-    const hcKey = getProvinceHcKey(d.province, mapData);
-    const isVisible = filteredNames.has(d.province);
+  const seriesData = mapData.features.map(f=>{
+    const p = f.properties || {};
+    const enName = p.name || '';
+    let province = normalizeProvinceName(EN_TO_TH[enName] || enName);
+    if(p['hc-key']==='th-bm') province = 'กรุงเทพมหานคร';
+    const d = dataByProvince.get(province);
+    const isVisible = filteredNames.has(province);
     return {
-      'hc-key': hcKey,
-      name: d.province,
-      province: d.province,
-      value: d.progress,
-      status: d.status,
-      total: d.total,
-      drafted: d.drafted,
-      color: isVisible ? COLORS[d.status] : '#e5e7eb',
-      opacity: isVisible ? 1 : 0.25
-    };
-  }).filter(d => d['hc-key']);
-
-  // ใส่พื้นที่ที่ไม่มีข้อมูลเป็นสีอ่อน เพื่อไม่ให้สับสนกับจังหวัดที่ยังไม่เริ่มจริง
-  const knownKeys = new Set(seriesData.map(d => d['hc-key']));
-  const noDataAreas = (mapData.features || [])
-    .map(f => f.properties || {})
-    .filter(p => p['hc-key'] && !knownKeys.has(p['hc-key']))
-    .map(p => ({
       'hc-key': p['hc-key'],
-      name: p.name || p['hc-key'],
-      province: p.name || p['hc-key'],
-      value: null,
-      status: 'ไม่มีข้อมูลในชีต',
-      total: 0,
-      drafted: 0,
-      color: '#f1f5f9',
-      opacity: 0.18
-    }));
+      name: province || enName,
+      province: province || enName,
+      value: d ? d.progress : null,
+      status: d ? d.status : 'ไม่พบข้อมูล',
+      total: d ? d.total : 0,
+      drafted: d ? d.drafted : 0,
+      color: d && isVisible ? COLORS[d.status] : '#e5e7eb',
+      borderColor: '#ffffff',
+      opacity: d && isVisible ? 1 : 0.35,
+      dataLabels: {enabled:false}
+    };
+  });
 
   mapChart = Highcharts.mapChart('map', {
     chart: {backgroundColor:'transparent', style:{fontFamily:'Noto Sans Thai, sans-serif'}},
@@ -380,7 +390,7 @@ function renderMap(){
         point:{
           events:{
             click:function(){
-              if(rawData.some(d=>d.province===this.province)){
+              if(dataByProvince.has(this.province)){
                 provinceFilter.value=this.province;
                 applyFilters();
               }
@@ -393,13 +403,10 @@ function renderMap(){
       type:'map',
       name:'สถานะความก้าวหน้า',
       mapData: mapData,
-      data: [...seriesData, ...noDataAreas],
-      dataLabels:{
-        enabled:true,
-        formatter:function(){ return this.point.province === 'กรุงเทพมหานคร' ? 'กทม.' : ''; },
-        style:{fontFamily:'Noto Sans Thai, sans-serif', fontSize:'11px', fontWeight:'800', color:'#111827', textOutline:'2px contrast'}
-      },
-      nullColor:'#f1f5f9'
+      data: seriesData,
+      keys:['hc-key','value'],
+      dataLabels:{enabled:false},
+      nullColor:'#e5e7eb'
     }]
   });
 }
@@ -438,9 +445,10 @@ Papa.parse(CSV_URL,{
   download:true,header:true,skipEmptyLines:true,
   complete:(res)=>{
     rawData=res.data.map(normalizeRow).filter(d=>d.province);
+    ensureBangkokIncluded(res.data);
     // กันชื่อจังหวัดซ้ำ เช่น กรุงเทพมหานคร/กรุงเทพฯ ให้รวมเป็นชื่อเดียว
     const merged = new Map();
-    rawData.forEach(d=>merged.set(d.province,d));
+    rawData.forEach(d=>merged.set(normalizeProvinceName(d.province), {...d, province: normalizeProvinceName(d.province)}));
     rawData=[...merged.values()];
     filtered=[...rawData];
     initFilters();
